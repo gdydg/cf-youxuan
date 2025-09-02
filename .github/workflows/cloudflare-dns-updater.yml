@@ -1,0 +1,89 @@
+# 文件名: .github/workflows/cloudflare-dns-updater.yml
+# 描述: 一个 GitHub Action 工作流程，用于定时从 API 获取 IP 并更新到 Cloudflare DNS。
+
+name: Sync IPs to Cloudflare DNS
+
+on:
+  # 允许您在 Actions 标签页手动触发此工作流程
+  workflow_dispatch:
+
+  # 设置定时任务，以下示例为每小时执行一次
+  # 您可以根据需求修改 cron 表达式
+  schedule:
+    - cron: '0 * * * *'
+
+jobs:
+  sync-ips:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        # 虽然此工作流不直接使用仓库代码，但这是一个好习惯
+        uses: actions/checkout@v4
+
+      - name: Fetch IPs and Update Cloudflare DNS
+        # 使用 env 关键字来安全地引用仓库的 Secrets
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+          IP_API_URL: ${{ secrets.IP_API_URL }}
+          CF_DNS_RECORD_NAME: ${{ secrets.CF_DNS_RECORD_NAME }}
+        run: |
+          # 检查必要的 secrets 是否已设置
+          if [ -z "$CF_API_TOKEN" ] || [ -z "$CF_ZONE_ID" ] || [ -z "$IP_API_URL" ] || [ -z "$CF_DNS_RECORD_NAME" ]; then
+            echo "错误：必要的 Secrets 未配置。请检查仓库的 Secrets 设置。"
+            echo "需要配置: CF_API_TOKEN, CF_ZONE_ID, IP_API_URL, CF_DNS_RECORD_NAME"
+            exit 1
+          fi
+
+          echo "正在从 API 获取 IP 列表..."
+          # 从指定的 API URL 获取 IP 列表，假设每行一个 IP
+          # -s 表示静默模式, -f 表示在 HTTP 错误时失败退出
+          ip_list=$(curl -sf "$IP_API_URL")
+          if [ -z "$ip_list" ]; then
+            echo "从 API 获取 IP 列表失败或列表为空。"
+            exit 1
+          fi
+          echo "获取到的 IP 列表: "
+          echo "$ip_list"
+
+          echo "正在从 Cloudflare 获取现有的 DNS 记录..."
+          # 使用 jq 工具解析 JSON 响应
+          existing_ips=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records?type=A&name=$CF_DNS_RECORD_NAME" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json" | jq -r '.result[].content')
+
+          echo "Cloudflare 中已存在的 IPs: $existing_ips"
+
+          # 循环处理从 API 获取的每一个 IP
+          for ip in $ip_list; do
+            # 检查 IP 地址格式是否合法
+            if ! [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "跳过无效的 IP 地址: $ip"
+              continue
+            fi
+            
+            # 检查该 IP 是否已经存在于 DNS 记录中
+            if echo "$existing_ips" | grep -q "^$ip$"; then
+              echo "IP $ip 已经存在于 Cloudflare，跳过。"
+            else
+              echo "发现新 IP $ip，正在添加到 Cloudflare..."
+              # 调用 Cloudflare API 添加新的 'A' 类型 DNS 记录
+              # proxied: false 表示 DNS-only，如果需要 CDN 功能请设为 true
+              add_result=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records" \
+                -H "Authorization: Bearer $CF_API_TOKEN" \
+                -H "Content-Type: application/json" \
+                --data "{\"type\":\"A\",\"name\":\"$CF_DNS_RECORD_NAME\",\"content\":\"$ip\",\"ttl\":60,\"proxied\":false}")
+              
+              # 检查 API 调用是否成功
+              success=$(echo "$add_result" | jq -r '.success')
+              if [ "$success" = "true" ]; then
+                echo "成功添加 IP $ip 到 Cloudflare。"
+              else
+                echo "添加 IP $ip 失败。"
+                echo "API 响应: $add_result"
+              fi
+            fi
+          done
+
+          echo "DNS 同步任务完成。"
+
